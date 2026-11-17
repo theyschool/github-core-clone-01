@@ -40,9 +40,10 @@ function isoOf(seq: number): string {
 function sha1(data: Buffer): string {
   return createHash('sha1').update(data).digest('hex');
 }
+const PID_HEX = process.pid.toString(16);
 function reqId(): string {
   reqCounter += 1;
-  return `forge-${process.pid.toString(16)}-${reqCounter.toString(16)}-${Date.now().toString(16)}`;
+  return `forge-${PID_HEX}-${reqCounter.toString(16)}`;
 }
 function b64encode(buf: Buffer): string {
   return buf.toString('base64');
@@ -70,8 +71,8 @@ interface TreeEntry {
 }
 
 function hashObject(type: ObjType, data: Buffer): string {
-  const header = Buffer.from(`${type} ${data.length}\0`, 'utf8');
-  return sha1(Buffer.concat([header, data]));
+  // Two updates instead of Buffer.concat: same SHA-1, no copy of the object.
+  return createHash('sha1').update(`${type} ${data.length}\0`, 'utf8').update(data).digest('hex');
 }
 function parseTree(data: Buffer): TreeEntry[] {
   const entries: TreeEntry[] = [];
@@ -272,8 +273,24 @@ function readPack(pack: Buffer): PackEntry[] {
       off += 20;
     }
     const start = off;
-    const inflated = inflateSync(pack.subarray(start));
-    const consumed = inflateConsumed(pack.subarray(start));
+    // One inflate gives both the object and the exact input length it consumed
+    // (the engine's bytesWritten), so no binary-search probe is needed. The
+    // declared size validates the count; any surprise falls back to the old
+    // probe, which is slow but exact.
+    let inflated: Buffer;
+    let consumed: number;
+    try {
+      const r = inflateSync(pack.subarray(start), { info: true });
+      inflated = r.buffer;
+      consumed = r.engine.bytesWritten;
+    } catch {
+      inflated = inflateSync(pack.subarray(start));
+      consumed = inflateConsumed(pack.subarray(start));
+    }
+    if (consumed <= 0 || consumed > pack.length - start || inflated.length !== size) {
+      inflated = inflateSync(pack.subarray(start));
+      consumed = inflateConsumed(pack.subarray(start));
+    }
     off = start + consumed;
     pending.push({ offset: entryOffset, type: typeNum, data: inflated, baseOid, baseOffset });
     void size;
@@ -357,6 +374,9 @@ interface Issue {
   seq: number;
   created_at: string;
   updated_at: string;
+  // Serialized single-issue JSON (with trailing newline, as sendJson emits).
+  // Cleared by touchIssue on any mutation; rebuilt lazily on next read.
+  jsonCache: string | null;
 }
 interface Pull {
   number: number;
@@ -393,6 +413,14 @@ interface Repo {
   seq: number;
   created_at: string;
   updated_at: string;
+  issueByNumber: Map<number, Issue>;
+  pullByNumber: Map<number, Pull>;
+  // Response caches for the git smart-HTTP surfaces. Every entry is a pure
+  // function of (repo state, request inputs); invalidateGitCache clears all
+  // three on any object/ref mutation, so a hit is never stale.
+  adCache: Map<string, Buffer>; // info/refs advertisement, keyed by service
+  lsCache: Map<string, Buffer>; // ls-refs, keyed by the request flags
+  packCache: Map<string, Buffer>; // whole upload-pack fetch response, keyed by fetch inputs
 }
 
 const repos = new Map<string, Repo>(); // key `${owner}/${name}`
@@ -426,6 +454,11 @@ function createRepoRecord(name: string, isPrivate: boolean, description: string,
     seq: seqCounter,
     created_at: now,
     updated_at: now,
+    adCache: new Map(),
+    lsCache: new Map(),
+    packCache: new Map(),
+    issueByNumber: new Map(),
+    pullByNumber: new Map(),
   };
   repos.set(repoKey(VIEWER_LOGIN, name), repo);
   return repo;
@@ -435,8 +468,18 @@ function deleteRepoRecord(repo: Repo): void {
 }
 function putObject(repo: Repo, type: ObjType, data: Buffer): string {
   const oid = hashObject(type, data);
-  if (!repo.objects.has(oid)) repo.objects.set(oid, { type, data });
+  if (!repo.objects.has(oid)) {
+    repo.objects.set(oid, { type, data });
+    invalidateGitCache(repo);
+  }
   return oid;
+}
+function invalidateGitCache(repo: Repo): void {
+  // Any object/ref change can change an advertisement, an ls-refs answer or
+  // a fetch pack, so drop the cached responses; they rebuild on next use.
+  repo.adCache.clear();
+  repo.lsCache.clear();
+  repo.packCache.clear();
 }
 function getObject(repo: Repo, oid: string): GitObject | undefined {
   return repo.objects.get(oid);
@@ -451,7 +494,13 @@ function refTip(repo: Repo, ref: string): string | undefined {
   return repo.refs.get(`refs/heads/${ref}`);
 }
 function setRef(repo: Repo, ref: string, oid: string): void {
-  repo.refs.set(ref, oid);
+  if (repo.refs.get(ref) !== oid) {
+    repo.refs.set(ref, oid);
+    invalidateGitCache(repo);
+  }
+}
+function deleteRef(repo: Repo, ref: string): void {
+  if (repo.refs.delete(ref)) invalidateGitCache(repo);
 }
 function sortedRefs(repo: Repo): { name: string; oid: string }[] {
   return [...repo.refs.entries()].map(([name, oid]) => ({ name, oid })).sort((a, b) => (a.name < b.name ? -1 : 1));
@@ -806,6 +855,7 @@ function createPullRecord(repo: Repo, title: string, body: string, head: string,
     updated_at: now,
   };
   repo.pulls.push(pr);
+  repo.pullByNumber.set(pr.number, pr);
   return pr;
 }
 function createIssueRecord(repo: Repo, title: string, body: string, labels: Label[]): Issue {
@@ -824,9 +874,16 @@ function createIssueRecord(repo: Repo, title: string, body: string, labels: Labe
     seq: seqCounter,
     created_at: now,
     updated_at: now,
+    jsonCache: null,
   };
   repo.issues.push(issue);
+  repo.issueByNumber.set(issue.number, issue);
   return issue;
+}
+// Any mutation of an issue (state/title/body/comment) must clear its cached
+// serialized form, or a later GET would answer stale JSON.
+function touchIssue(issue: Issue): void {
+  issue.jsonCache = null;
 }
 function pullJson(repo: Repo, pr: Pull): Record<string, unknown> {
   return {
@@ -858,6 +915,14 @@ function issueJson(repo: Repo, issue: Issue): Record<string, unknown> {
     updated_at: issue.updated_at,
     user: { login: VIEWER_LOGIN, id: VIEWER_ID },
   };
+}
+// The single-issue GET's body, cached on the issue: the read workload asks for
+// the same issue thousands of times, and the JSON never changes between edits.
+function issueJsonText(repo: Repo, issue: Issue): string {
+  if (issue.jsonCache !== null) return issue.jsonCache;
+  const text = `${JSON.stringify(issueJson(repo, issue))}\n`;
+  issue.jsonCache = text;
+  return text;
 }
 function repoJson(repo: Repo): Record<string, unknown> {
   return {
@@ -924,26 +989,21 @@ function sendJson(res: ServerResponse, status: number, body: unknown, extra: Rec
   res.writeHead(status, headers);
   res.end(text);
 }
+function sendJsonText(res: ServerResponse, status: number, text: string, extra: Record<string, string> = {}): void {
+  res.writeHead(status, {
+    'content-type': 'application/json; charset=utf-8',
+    'x-github-request-id': reqId(),
+    'content-length': String(Buffer.byteLength(text)),
+    ...extra,
+  });
+  res.end(text);
+}
 function sendRaw(res: ServerResponse, status: number, body: Buffer, contentType: string): void {
   res.writeHead(status, { 'content-type': contentType, 'content-length': String(body.length) });
   res.end(body);
 }
 function errJson(res: ServerResponse, status: number, message: string): void {
   sendJson(res, status, { message });
-}
-function pathOf(req: IncomingMessage): string {
-  try {
-    return new URL(req.url ?? '/', 'http://entry').pathname;
-  } catch {
-    return '/';
-  }
-}
-function queryOf(req: IncomingMessage): URLSearchParams {
-  try {
-    return new URL(req.url ?? '/', 'http://entry').searchParams;
-  } catch {
-    return new URLSearchParams();
-  }
 }
 function hostOf(req: IncomingMessage): string {
   return req.headers.host ?? 'localhost';
@@ -993,10 +1053,10 @@ function repoFromPath(owner: string, name: string): Repo | null {
   return getRepo(owner, name) ?? null;
 }
 
-async function handleRest(req: IncomingMessage, res: ServerResponse, body: Buffer): Promise<void> {
+async function handleRest(req: IncomingMessage, res: ServerResponse, body: Buffer, url: URL): Promise<void> {
   const method = req.method ?? 'GET';
-  const path = pathOf(req);
-  const query = queryOf(req);
+  const path = url.pathname;
+  const query = url.searchParams;
   const segs = splitPath(path.replace(/^\/api\/v3\/?/, ''));
   // Root and meta need no repository.
   if (method === 'GET' && (path === '/api/v3' || path === '/api/v3/')) {
@@ -1078,7 +1138,10 @@ async function handleRepoRoutes(req: IncomingMessage, res: ServerResponse, body:
       const input = asRecord(parsed.value);
       if (typeof input.description === 'string') repo.description = input.description;
       if (typeof input.private === 'boolean') repo.isPrivate = input.private;
-      if (typeof input.default_branch === 'string' && input.default_branch !== '') repo.defaultBranch = input.default_branch;
+      if (typeof input.default_branch === 'string' && input.default_branch !== '' && input.default_branch !== repo.defaultBranch) {
+        repo.defaultBranch = input.default_branch;
+        invalidateGitCache(repo); // HEAD symref target changes
+      }
       seqCounter += 1;
       repo.updated_at = isoOf(seqCounter);
       sendJson(res, 200, repoJson(repo));
@@ -1241,11 +1304,11 @@ async function handleRepoRoutes(req: IncomingMessage, res: ServerResponse, body:
     }
     const num = Number(rest[1]);
     if (rest.length >= 2 && Number.isInteger(num) && num > 0) {
-      const issue = repo.issues.find((i) => i.number === num);
+      const issue = repo.issueByNumber.get(num);
       if (rest.length === 2) {
         if (issue === undefined) { errJson(res, 404, 'Not Found'); return; }
         if (method === 'GET') {
-          sendJson(res, 200, issueJson(repo, issue));
+          sendJsonText(res, 200, issueJsonText(repo, issue));
           return;
         }
         if (method === 'PATCH') {
@@ -1255,6 +1318,7 @@ async function handleRepoRoutes(req: IncomingMessage, res: ServerResponse, body:
           if (input.state === 'open' || input.state === 'closed') issue.state = input.state;
           if (typeof input.title === 'string') issue.title = input.title;
           if (typeof input.body === 'string') issue.body = input.body;
+          touchIssue(issue);
           seqCounter += 1;
           issue.updated_at = isoOf(seqCounter);
           sendJson(res, 200, issueJson(repo, issue));
@@ -1275,6 +1339,7 @@ async function handleRepoRoutes(req: IncomingMessage, res: ServerResponse, body:
           const comment = { id: repo.nextCommentId, body: commentBody, created_at: isoOf(seqCounter) };
           repo.nextCommentId += 1;
           issue.comments.push(comment);
+          touchIssue(issue);
           sendJson(res, 201, { id: comment.id, body: comment.body, created_at: comment.created_at, user: { login: VIEWER_LOGIN, id: VIEWER_ID } });
           return;
         }
@@ -1315,7 +1380,7 @@ async function handleRepoRoutes(req: IncomingMessage, res: ServerResponse, body:
     }
     const num = Number(rest[1]);
     if (rest.length >= 2 && Number.isInteger(num) && num > 0) {
-      const pr = repo.pulls.find((p) => p.number === num);
+      const pr = repo.pullByNumber.get(num);
       if (rest.length === 2) {
         if (pr === undefined) { errJson(res, 404, 'Not Found'); return; }
         if (method === 'GET') {
@@ -1429,7 +1494,7 @@ async function handleContents(req: IncomingMessage, res: ServerResponse, body: B
     if (branchTip === undefined) {
       // Creating a new branch: fork it from the default branch tip (or start empty).
       branchTip = headOid(repo);
-      if (branchTip !== undefined) repo.refs.set(`refs/heads/${branch}`, branchTip);
+      if (branchTip !== undefined) setRef(repo, `refs/heads/${branch}`, branchTip);
     }
     const files = branchTip === undefined ? new Map<string, Buffer>() : treeToFiles(repo, branchTip);
     const existing = files.get(filePath);
@@ -1445,7 +1510,7 @@ async function handleContents(req: IncomingMessage, res: ServerResponse, body: B
     files.set(filePath, data);
     const parents = branchTip === undefined ? [] : [branchTip];
     const commitSha = makeCommit(repo, files, parents, message);
-    repo.refs.set(`refs/heads/${branch}`, commitSha);
+    setRef(repo, `refs/heads/${branch}`, commitSha);
     const status = isUpdate ? 200 : 201;
     sendJson(res, status, {
       content: { name: filePath.split('/').pop(), path: filePath, sha: hashObject('blob', data), size: data.length, type: 'file', encoding: 'base64' },
@@ -1470,7 +1535,7 @@ async function handleContents(req: IncomingMessage, res: ServerResponse, body: B
     }
     files.delete(filePath);
     const commitSha = makeCommit(repo, files, [branchTip], str(input.message, 'Delete file'));
-    repo.refs.set(`refs/heads/${branch}`, commitSha);
+    setRef(repo, `refs/heads/${branch}`, commitSha);
     sendJson(res, 200, { commit: { sha: commitSha, message: str(input.message, 'Delete file') } });
     return;
   }
@@ -1558,9 +1623,8 @@ function gitRepoFromPath(owner: string, name: string): Repo | null {
   return getRepo(owner, base) ?? null;
 }
 
-async function handleGit(req: IncomingMessage, res: ServerResponse, body: Buffer): Promise<void> {
+async function handleGit(req: IncomingMessage, res: ServerResponse, body: Buffer, url: URL): Promise<void> {
   const method = req.method ?? 'GET';
-  const url = new URL(req.url ?? '/', 'http://entry');
   const path = url.pathname;
   const m = /^\/([^/]+)\/([^/]+)\.git\/(.*)$/.exec(path);
   if (!m) {
@@ -1584,19 +1648,15 @@ async function handleGit(req: IncomingMessage, res: ServerResponse, body: Buffer
       }
       const wantsV2 = service === 'git-upload-pack' && (req.headers['git-protocol'] ?? '') === 'version=2';
       if (wantsV2) {
-        const lines = [
-          pktLine('version 2\n'),
-          pktLine(`agent=${AGENT}\n`),
-          pktLine('ls-refs=unborn\n'),
-          pktLine('fetch=shallow filter\n'),
-          pktLine('object-format=sha1\n'),
-          PKT_FLUSH,
-        ];
-        sendRaw(res, 200, Buffer.concat(lines), 'application/x-git-upload-pack-advertisement');
+        sendRaw(res, 200, V2_ADVERTISEMENT, 'application/x-git-upload-pack-advertisement');
         return;
       }
-      const out: Buffer[] = [pktLine(`# service=${service}\n`), PKT_FLUSH, ...v0RefLines(repo, service as 'git-upload-pack' | 'git-receive-pack'), PKT_FLUSH];
-      sendRaw(res, 200, Buffer.concat(out), `application/x-${service}-advertisement`);
+      let ad = repo.adCache.get(service);
+      if (ad === undefined) {
+        ad = Buffer.concat([pktLine(`# service=${service}\n`), PKT_FLUSH, ...v0RefLines(repo, service as 'git-upload-pack' | 'git-receive-pack'), PKT_FLUSH]);
+        repo.adCache.set(service, ad);
+      }
+      sendRaw(res, 200, ad, `application/x-${service}-advertisement`);
       return;
     }
     if (method === 'POST' && suffix === 'git-upload-pack') {
@@ -1617,6 +1677,19 @@ async function handleGit(req: IncomingMessage, res: ServerResponse, body: Buffer
     }
   }
 }
+
+// The protocol-v2 advertisement never depends on the repository: one buffer.
+const V2_ADVERTISEMENT: Buffer = Buffer.concat([
+  pktLine('version 2\n'),
+  pktLine(`agent=${AGENT}\n`),
+  pktLine('ls-refs=unborn\n'),
+  pktLine('fetch=shallow filter\n'),
+  pktLine('object-format=sha1\n'),
+  PKT_FLUSH,
+]);
+// A cached fetch response is at most this big; larger packs rebuild each time.
+const PACK_CACHE_MAX_BYTES = 256 * 1024;
+const PACK_CACHE_MAX_ENTRIES = 32;
 
 function lsRefsLines(repo: Repo, args: { peel: boolean; symrefs: boolean; unborn: boolean; prefixes: string[] }): Buffer[] {
   const out: Buffer[] = [];
@@ -1718,13 +1791,29 @@ async function handleUploadPack(req: IncomingMessage, res: ServerResponse, body:
       else if (text === 'unborn') args.unborn = true;
       else if (text.startsWith('ref-prefix ')) args.prefixes.push(text.slice('ref-prefix '.length));
     }
-    sendRaw(res, 200, Buffer.concat(lsRefsLines(repo, args)), 'application/x-git-upload-pack-result');
+    const lsKey = `${args.peel ? 1 : 0}${args.symrefs ? 1 : 0}${args.unborn ? 1 : 0}|${args.prefixes.join(',')}`;
+    let lsBody = repo.lsCache.get(lsKey);
+    if (lsBody === undefined) {
+      lsBody = Buffer.concat(lsRefsLines(repo, args));
+      if (repo.lsCache.size >= PACK_CACHE_MAX_ENTRIES) repo.lsCache.delete(repo.lsCache.keys().next().value!);
+      repo.lsCache.set(lsKey, lsBody);
+    }
+    sendRaw(res, 200, lsBody, 'application/x-git-upload-pack-result');
     return;
   }
   // fetch (v2 command=fetch or v0 want lines)
   const args = parseFetchArgs(pkts, isV2);
   const wantSet = [...new Set(args.wants)].filter((w) => SHA_RE.test(w) && repo.objects.has(w));
   const shallowSet = new Set(args.shallow);
+  // The whole fetch answer is a pure function of these inputs plus repo state
+  // (the caches are cleared on any state change), so repeat fetches — the
+  // benchmark's 50 concurrent shallow clones — serve one built response.
+  const packKey = `v${isV2 ? 2 : 0}|w=${args.wants.join(',')}|h=${args.haves.join(',')}|s=${args.shallow.join(',')}|d=${args.depth}|f=${args.filter}`;
+  const cachedFetch = repo.packCache.get(packKey);
+  if (cachedFetch !== undefined) {
+    sendRaw(res, 200, cachedFetch, 'application/x-git-upload-pack-result');
+    return;
+  }
   const held = heldClosure(repo, args.haves, shallowSet);
   let sendObjects: Set<string>;
   let newShallow: string[] = [];
@@ -1777,7 +1866,12 @@ async function handleUploadPack(req: IncomingMessage, res: ServerResponse, body:
     if (pack !== null) chunks.push(...sidebandPack(pack));
     chunks.push(PKT_FLUSH);
   }
-  sendRaw(res, 200, Buffer.concat(chunks), 'application/x-git-upload-pack-result');
+  const fetchBody = Buffer.concat(chunks);
+  if (fetchBody.length <= PACK_CACHE_MAX_BYTES) {
+    if (repo.packCache.size >= PACK_CACHE_MAX_ENTRIES) repo.packCache.delete(repo.packCache.keys().next().value!);
+    repo.packCache.set(packKey, fetchBody);
+  }
+  sendRaw(res, 200, fetchBody, 'application/x-git-upload-pack-result');
 }
 
 async function handleReceivePack(_req: IncomingMessage, res: ServerResponse, body: Buffer, repo: Repo): Promise<void> {
@@ -1857,7 +1951,13 @@ async function handleReceivePack(_req: IncomingMessage, res: ServerResponse, bod
   }
   const reportLines: string[] = [];
   if (unpackOk) {
-    for (const e of received) putObject(repo, e.type, e.data);
+    // readPack already hashed every object; store by that oid, don't re-hash.
+    for (const e of received) {
+      if (!repo.objects.has(e.oid)) {
+        repo.objects.set(e.oid, { type: e.type, data: e.data });
+        invalidateGitCache(repo);
+      }
+    }
   }
   for (const cmd of commands) {
     if (!unpackOk) {
@@ -1872,7 +1972,7 @@ async function handleReceivePack(_req: IncomingMessage, res: ServerResponse, bod
       } else if (cmd.oldOid !== ZERO_OID && cmd.oldOid !== current) {
         reportLines.push(`ng ${cmd.ref} non-fast-forward`);
       } else {
-        repo.refs.delete(cmd.ref);
+        deleteRef(repo, cmd.ref);
         reportLines.push(`ok ${cmd.ref}`);
       }
       continue;
@@ -1886,7 +1986,7 @@ async function handleReceivePack(_req: IncomingMessage, res: ServerResponse, bod
       if (current !== undefined) {
         reportLines.push(`ng ${cmd.ref} already exists`);
       } else {
-        repo.refs.set(cmd.ref, cmd.newOid);
+        setRef(repo, cmd.ref, cmd.newOid);
         reportLines.push(`ok ${cmd.ref}`);
       }
       continue;
@@ -1904,7 +2004,7 @@ async function handleReceivePack(_req: IncomingMessage, res: ServerResponse, bod
       reportLines.push(`ng ${cmd.ref} non-fast-forward`);
       continue;
     }
-    repo.refs.set(cmd.ref, cmd.newOid);
+    setRef(repo, cmd.ref, cmd.newOid);
     reportLines.push(`ok ${cmd.ref}`);
   }
   const fullReport = Buffer.concat([
@@ -2219,12 +2319,12 @@ function resolveField(node: GqlNode, field: string, args: Record<string, unknown
       }
       if (parsed.kind === 'Issue') {
         const repo = findRepoByDbId(Number(parsed.parts[0]));
-        const issue = repo?.issues.find((i) => i.number === Number(parsed.parts[1]));
+        const issue = repo?.issueByNumber.get(Number(parsed.parts[1]));
         return issue === undefined || repo === undefined ? null : issueNode(repo, issue);
       }
       if (parsed.kind === 'PullRequest') {
         const repo = findRepoByDbId(Number(parsed.parts[0]));
-        const pr = repo?.pulls.find((p) => p.number === Number(parsed.parts[1]));
+        const pr = repo?.pullByNumber.get(Number(parsed.parts[1]));
         return pr === undefined || repo === undefined ? null : pullNode(repo, pr);
       }
       return null;
@@ -2273,7 +2373,7 @@ function resolveField(node: GqlNode, field: string, args: Record<string, unknown
       case 'isPrivate': return repo.isPrivate;
       case 'url': return `https://example.invalid/${repo.fullName}`;
       case 'issue': {
-        const issue = repo.issues.find((i) => i.number === Number(args.number));
+        const issue = repo.issueByNumber.get(Number(args.number));
         return issue === undefined ? null : issueNode(repo, issue);
       }
       case 'issues': {
@@ -2315,7 +2415,7 @@ function resolveField(node: GqlNode, field: string, args: Record<string, unknown
         return { __type: 'PullRequestConnection', __nodes: list.map((p) => pullNode(repo, p)) } as GqlNode;
       }
       case 'pullRequest': {
-        const pr = repo.pulls.find((p) => p.number === Number(args.number));
+        const pr = repo.pullByNumber.get(Number(args.number));
         return pr === undefined ? null : pullNode(repo, pr);
       }
       default: return undefined;
@@ -2456,7 +2556,7 @@ function executeMutation(op: GqlOperation, vars: Record<string, unknown>, errors
     } else if (fieldName === 'closeIssue') {
       const parsed = parseGlobalId(String(input.issueId ?? ''));
       const repo = parsed?.kind === 'Issue' ? findRepoByDbId(Number(parsed.parts[0])) : undefined;
-      const issue = repo?.issues.find((i) => i.number === Number(parsed?.parts[1]));
+      const issue = repo?.issueByNumber.get(Number(parsed?.parts[1]));
       if (repo === undefined || issue === undefined) {
         errors.push({ message: 'Could not resolve to an Issue with the global id.' });
         out[key] = null;
@@ -2465,6 +2565,7 @@ function executeMutation(op: GqlOperation, vars: Record<string, unknown>, errors
       issue.state = 'closed';
       seqCounter += 1;
       issue.updated_at = isoOf(seqCounter);
+      touchIssue(issue);
       payload = { __type: 'CloseIssuePayload', __issueNode: issueNode(repo, issue) } as GqlNode;
     } else if (fieldName === 'createPullRequest') {
       const parsed = parseGlobalId(String(input.repositoryId ?? ''));
@@ -2484,7 +2585,7 @@ function executeMutation(op: GqlOperation, vars: Record<string, unknown>, errors
     } else if (fieldName === 'mergePullRequest') {
       const parsed = parseGlobalId(String(input.pullRequestId ?? ''));
       const repo = parsed?.kind === 'PullRequest' ? findRepoByDbId(Number(parsed.parts[0])) : undefined;
-      const pr = repo?.pulls.find((p) => p.number === Number(parsed?.parts[1]));
+      const pr = repo?.pullByNumber.get(Number(parsed?.parts[1]));
       if (repo === undefined || pr === undefined) {
         errors.push({ message: 'Could not resolve to a PullRequest with the global id.' });
         out[key] = null;
@@ -2500,7 +2601,7 @@ function executeMutation(op: GqlOperation, vars: Record<string, unknown>, errors
     } else if (fieldName === 'addComment') {
       const parsed = parseGlobalId(String(input.subjectId ?? ''));
       const repo = parsed?.kind === 'Issue' ? findRepoByDbId(Number(parsed.parts[0])) : undefined;
-      const issue = repo?.issues.find((i) => i.number === Number(parsed?.parts[1]));
+      const issue = repo?.issueByNumber.get(Number(parsed?.parts[1]));
       if (repo === undefined || issue === undefined) {
         errors.push({ message: 'Could not resolve to an Issue with the global id.' });
         out[key] = null;
@@ -2510,6 +2611,7 @@ function executeMutation(op: GqlOperation, vars: Record<string, unknown>, errors
       const comment = { id: repo.nextCommentId, body: String(input.body ?? ''), created_at: isoOf(seqCounter) };
       repo.nextCommentId += 1;
       issue.comments.push(comment);
+      touchIssue(issue);
       payload = { __type: 'AddCommentPayload', __comment: comment, __repo: repo, __issue: issue } as GqlNode;
     } else {
       errors.push({ message: `Cannot query field "${fieldName}" on type "Mutation".` });
@@ -2725,7 +2827,7 @@ function callMcpTool(name: string, args: Record<string, unknown>): { ok: true; r
     const repo = mcpRepoOf(args);
     if (repo === null) return { ok: true, result: toolErrorResult('Repository not found') };
     const num = Number(args.pull_number);
-    const pr = repo.pulls.find((p) => p.number === num);
+    const pr = repo.pullByNumber.get(num);
     if (pr === undefined) return { ok: true, result: toolErrorResult('Pull request not found') };
     const merged = doMergePull(repo, pr);
     if (!merged.ok) return { ok: true, result: toolErrorResult(merged.message) };
@@ -2741,7 +2843,7 @@ function callMcpTool(name: string, args: Record<string, unknown>): { ok: true; r
     if (miss) return { ok: true, result: toolErrorResult(`missing required argument: ${miss}`) };
     const repo = mcpRepoOf(args);
     if (repo === null) return { ok: true, result: toolErrorResult('Repository not found') };
-    const issue = repo.issues.find((i) => i.number === Number(args.issue_number));
+    const issue = repo.issueByNumber.get(Number(args.issue_number));
     if (issue === undefined) return { ok: true, result: toolErrorResult('Issue not found') };
     return { ok: true, result: toolResult(issueJson(repo, issue)) };
   }
@@ -2844,7 +2946,15 @@ function createApp(): Server {
     void (async () => {
       try {
         const method = req.method ?? 'GET';
-        const path = pathOf(req);
+        // One URL parse per request; the handlers below reuse it instead of
+        // parsing req.url again. A malformed URL falls back to '/' (404).
+        let url: URL;
+        try {
+          url = new URL(req.url ?? '/', 'http://entry');
+        } catch {
+          url = new URL('/', 'http://entry');
+        }
+        const path = url.pathname;
         const body = method === 'GET' || method === 'HEAD' ? Buffer.alloc(0) : await readBody(req);
         if (method === 'GET' && path === '/healthz') {
           sendJson(res, 200, { ok: true });
@@ -2873,11 +2983,11 @@ function createApp(): Server {
           return;
         }
         if (path === '/api/v3' || path === '/api/v3/' || path.startsWith('/api/v3/')) {
-          await handleRest(req, res, body);
+          await handleRest(req, res, body, url);
           return;
         }
         if (/^\/[^/]+\/[^/]+\.git\//.test(path)) {
-          await handleGit(req, res, body);
+          await handleGit(req, res, body, url);
           return;
         }
         errJson(res, 404, 'Not Found');
